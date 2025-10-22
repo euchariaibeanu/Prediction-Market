@@ -194,15 +194,17 @@
 ;;   - policy-description: Detailed description of the policy being predicted
 ;;   - betting-closes-at-block: Block height when betting period ends
 ;; Returns: Market identifier on success
-(define-public (create-prediction-market (policy-description (string-ascii 256)) (betting-closes-at-block uint))
+(define-public (establish-prediction-market 
+  (policy-description (string-ascii 256)) 
+  (betting-closes-at-block uint))
   (let
     (
       (market-identifier (var-get next-available-market-id))
-      (market-expires-at-block (+ betting-closes-at-block (var-get market-expiration-period)))
+      (calculated-expiration (+ betting-closes-at-block (var-get market-expiration-period)))
     )
     (asserts! (validate-description-length policy-description) ERR-INVALID-PARAMETER-VALUE)
     (asserts! (validate-closing-block-height betting-closes-at-block) ERR-INVALID-CLOSING-BLOCK)
-    (asserts! (validate-expiration-block-height betting-closes-at-block market-expires-at-block) ERR-INVALID-PARAMETER-VALUE)
+    (asserts! (validate-expiration-block-height betting-closes-at-block calculated-expiration) ERR-INVALID-PARAMETER-VALUE)
     
     (map-set prediction-markets
       { market-identifier: market-identifier }
@@ -210,7 +212,7 @@
         policy-description: policy-description,
         resolved-outcome: none,
         betting-closes-at-block: betting-closes-at-block,
-        market-expires-at-block: market-expires-at-block,
+        market-expires-at-block: calculated-expiration,
         market-creator: tx-sender,
         total-liquidity-pool: u0,
         total-yes-wagers: u0,
@@ -218,167 +220,180 @@
         accumulated-fees: u0
       }
     )
+    
     (var-set next-available-market-id (+ market-identifier u1))
     (ok market-identifier)
   )
 )
 
-;; Public Function: Place Wager on Market
-;; Allows users to bet on their predicted outcome for a specific market
-;; Automatically deducts platform and liquidity provider fees
+;; Public Function: Place Prediction Wager
+;; Allows users to bet on a specific outcome for an active prediction market
 ;; Parameters:
-;;   - market-identifier: ID of the target prediction market
-;;   - predicted-outcome: Boolean representing the predicted result
-;;   - wager-amount: Amount of STX tokens to wager
-;; Returns: Success confirmation with transaction details
-(define-public (submit-wager (market-identifier uint) (predicted-outcome bool) (wager-amount uint))
+;;   - market-identifier: ID of the market to bet on
+;;   - predicted-outcome: Boolean representing the predicted result (true/false)
+;;   - wager-amount: Amount of STX to wager
+;; Returns: Success confirmation
+(define-public (place-prediction-wager 
+  (market-identifier uint) 
+  (predicted-outcome bool) 
+  (wager-amount uint))
   (let
     (
-      (existing-wager (default-to { wager-amount: u0, predicted-outcome: false } 
-                      (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender })))
+      (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
+      (platform-fee (calculate-platform-fee wager-amount))
+      (lp-fee (calculate-liquidity-provider-fee wager-amount))
+      (net-wager (calculate-net-wager wager-amount))
+      (existing-wager (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender }))
     )
+    ;; Validate market identifier is within valid range
     (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
+    (asserts! (< block-height (get betting-closes-at-block market-data)) ERR-BETTING-PERIOD-ENDED)
+    (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
     (asserts! (validate-wager-amount wager-amount) ERR-INVALID-WAGER)
-    (let
-      (
-        (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
-        (total-wager-amount (+ wager-amount (get wager-amount existing-wager)))
-        (platform-fee (calculate-platform-fee wager-amount))
-        (lp-fee (calculate-liquidity-provider-fee wager-amount))
-        (net-wager (calculate-net-wager wager-amount))
-      )
-      (asserts! (<= total-wager-amount (var-get maximum-wager-threshold)) ERR-WAGER-EXCEEDS-MAXIMUM)
-      (asserts! (< block-height (get betting-closes-at-block market-data)) ERR-BETTING-PERIOD-ENDED)
-      (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
-      (asserts! (>= (stx-get-balance tx-sender) wager-amount) ERR-INSUFFICIENT-BALANCE)
-      
-      (map-set user-wagers
-        { market-identifier: market-identifier, participant: tx-sender }
-        { wager-amount: total-wager-amount, predicted-outcome: predicted-outcome }
-      )
-      
-      (map-set prediction-markets
-        { market-identifier: market-identifier }
-        (merge market-data {
-          total-yes-wagers: (if predicted-outcome 
-            (+ (get total-yes-wagers market-data) net-wager)
-            (get total-yes-wagers market-data)),
-          total-no-wagers: (if predicted-outcome
-            (get total-no-wagers market-data)
-            (+ (get total-no-wagers market-data) net-wager)),
-          accumulated-fees: (+ (get accumulated-fees market-data) lp-fee)
-        })
-      )
-      
-      (var-set total-platform-fees-collected 
-        (+ (var-get total-platform-fees-collected) platform-fee))
-      
-      (try! (stx-transfer? wager-amount tx-sender (as-contract tx-sender)))
-      (ok { net-wager: net-wager, platform-fee: platform-fee, lp-fee: lp-fee })
+    (asserts! (is-none existing-wager) ERR-INVALID-WAGER)
+    
+    (try! (stx-transfer? wager-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set user-wagers
+      { market-identifier: market-identifier, participant: tx-sender }
+      { wager-amount: net-wager, predicted-outcome: predicted-outcome }
     )
+    
+    (map-set prediction-markets
+      { market-identifier: market-identifier }
+      (merge market-data {
+        total-yes-wagers: (if predicted-outcome 
+          (+ (get total-yes-wagers market-data) net-wager)
+          (get total-yes-wagers market-data)),
+        total-no-wagers: (if predicted-outcome 
+          (get total-no-wagers market-data)
+          (+ (get total-no-wagers market-data) net-wager)),
+        accumulated-fees: (+ (get accumulated-fees market-data) lp-fee)
+      })
+    )
+    
+    (var-set total-platform-fees-collected (+ (var-get total-platform-fees-collected) platform-fee))
+    
+    (ok true)
   )
 )
 
-;; Public Function: Resolve Market Outcome
-;; Allows market creator to set the final outcome after betting closes
+;; Public Function: Resolve Prediction Market
+;; Allows market creator or admin to set the final outcome of a market
 ;; Parameters:
 ;;   - market-identifier: ID of the market to resolve
-;;   - actual-outcome: The actual policy outcome (true/false)
+;;   - actual-outcome: The actual result of the policy outcome
 ;; Returns: Success confirmation
-(define-public (determine-market-outcome (market-identifier uint) (actual-outcome bool))
+(define-public (resolve-prediction-market 
+  (market-identifier uint) 
+  (actual-outcome bool))
   (let
     (
       (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
     )
-    (asserts! (is-eq tx-sender (get market-creator market-data)) ERR-UNAUTHORIZED-ACCESS)
+    ;; Validate market identifier is within valid range
+    (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
     (asserts! (>= block-height (get betting-closes-at-block market-data)) ERR-BETTING-STILL-ACTIVE)
     (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
-    (asserts! (not (check-market-expiration market-identifier)) ERR-LIFECYCLE-EXPIRED)
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get market-creator market-data))
+        (is-eq tx-sender (var-get platform-administrator))
+      ) 
+      ERR-UNAUTHORIZED-ACCESS
+    )
     
     (map-set prediction-markets
       { market-identifier: market-identifier }
       (merge market-data { resolved-outcome: (some actual-outcome) })
     )
+    
     (ok true)
   )
 )
 
 ;; Public Function: Claim Winning Rewards
-;; Allows users with correct predictions to claim their winnings
+;; Allows users with correct predictions to withdraw their winnings
 ;; Parameters:
-;;   - market-identifier: ID of the resolved market
-;; Returns: Amount of STX transferred to winner
+;;   - market-identifier: ID of the market to claim from
+;; Returns: Amount of winnings transferred
 (define-public (withdraw-winnings (market-identifier uint))
   (let
     (
       (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
-      (user-wager (unwrap! (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender }) ERR-WAGER-NOT-FOUND))
-      (final-outcome (unwrap! (get resolved-outcome market-data) ERR-OUTCOME-NOT-DETERMINED))
+      (user-wager-data (unwrap! (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender }) ERR-WAGER-NOT-FOUND))
+      (resolved-outcome-value (unwrap! (get resolved-outcome market-data) ERR-OUTCOME-NOT-DETERMINED))
+      (user-predicted-outcome (get predicted-outcome user-wager-data))
+      (user-wager-amount (get wager-amount user-wager-data))
+      (winning-side-total (if resolved-outcome-value 
+        (get total-yes-wagers market-data)
+        (get total-no-wagers market-data)))
+      (losing-side-total (if resolved-outcome-value 
+        (get total-no-wagers market-data)
+        (get total-yes-wagers market-data)))
+      (proportional-winnings (if (> winning-side-total u0)
+        (/ (* user-wager-amount losing-side-total) winning-side-total)
+        u0))
+      (total-payout (+ user-wager-amount proportional-winnings))
     )
-    (asserts! (is-eq (get predicted-outcome user-wager) final-outcome) ERR-INCORRECT-PREDICTION)
+    ;; Validate market identifier is within valid range
+    (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
+    (asserts! (is-eq user-predicted-outcome resolved-outcome-value) ERR-INCORRECT-PREDICTION)
     
     (map-delete user-wagers { market-identifier: market-identifier, participant: tx-sender })
-    (as-contract (stx-transfer? (get wager-amount user-wager) tx-sender tx-sender))
+    
+    (as-contract (stx-transfer? total-payout tx-sender tx-sender))
   )
 )
 
-;; Public Function: Refund Expired Market Wager
-;; Allows users to reclaim wagers from unresolved expired markets
+;; Public Function: Claim Expired Market Refund
+;; Allows users to withdraw their wager if market expired without resolution
 ;; Parameters:
 ;;   - market-identifier: ID of the expired market
-;; Returns: Amount of STX refunded to user
-(define-public (reclaim-expired-wager (market-identifier uint))
+;; Returns: Amount refunded
+(define-public (claim-expiration-refund (market-identifier uint))
   (let
     (
       (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
-      (user-wager (unwrap! (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender }) ERR-WAGER-NOT-FOUND))
+      (user-wager-data (unwrap! (map-get? user-wagers { market-identifier: market-identifier, participant: tx-sender }) ERR-WAGER-NOT-FOUND))
+      (refund-amount (get wager-amount user-wager-data))
     )
+    ;; Validate market identifier is within valid range
+    (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
     (asserts! (check-market-expiration market-identifier) ERR-LIFECYCLE-NOT-EXPIRED)
     (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
     
     (map-delete user-wagers { market-identifier: market-identifier, participant: tx-sender })
-    (as-contract (stx-transfer? (get wager-amount user-wager) tx-sender tx-sender))
-  )
-)
-
-;; Public Function: Remove Expired Market
-;; Allows market creator to clean up expired unresolved markets
-;; Parameters:
-;;   - market-identifier: ID of the expired market to remove
-;; Returns: Success confirmation
-(define-public (remove-expired-market (market-identifier uint))
-  (let
-    (
-      (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
-    )
-    (asserts! (is-eq tx-sender (get market-creator market-data)) ERR-UNAUTHORIZED-ACCESS)
-    (asserts! (check-market-expiration market-identifier) ERR-LIFECYCLE-NOT-EXPIRED)
-    (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
     
-    (map-delete prediction-markets { market-identifier: market-identifier })
-    (ok true)
+    (as-contract (stx-transfer? refund-amount tx-sender tx-sender))
   )
 )
-
-;; LIQUIDITY POOL SYSTEM
 
 ;; Public Function: Provide Liquidity to Market
-;; Allows users to become liquidity providers for a specific market
-;; Liquidity providers earn fees from all wagers placed on the market
+;; Allows users to provide liquidity to a market's pool
 ;; Parameters:
-;;   - market-identifier: ID of the market to provide liquidity for
+;;   - market-identifier: ID of the market
 ;;   - liquidity-amount: Amount of STX to provide as liquidity
-;; Returns: Success confirmation with liquidity position details
+;; Returns: Success confirmation
 (define-public (provide-market-liquidity (market-identifier uint) (liquidity-amount uint))
   (let
     (
       (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
       (existing-position (map-get? liquidity-positions { market-identifier: market-identifier, liquidity-provider: tx-sender }))
     )
+    ;; Validate market identifier is within valid range
+    (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
+    (asserts! (>= liquidity-amount (var-get minimum-liquidity-amount)) ERR-INSUFFICIENT-LIQUIDITY)
     (asserts! (is-none existing-position) ERR-LIQUIDITY-ALREADY-PROVIDED)
-    (asserts! (>= liquidity-amount (var-get minimum-liquidity-amount)) ERR-INVALID-PARAMETER-VALUE)
     (asserts! (< block-height (get betting-closes-at-block market-data)) ERR-BETTING-PERIOD-ENDED)
-    (asserts! (>= (stx-get-balance tx-sender) liquidity-amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (is-none (get resolved-outcome market-data)) ERR-OUTCOME-ALREADY-DETERMINED)
+    
+    (try! (stx-transfer? liquidity-amount tx-sender (as-contract tx-sender)))
     
     (map-set liquidity-positions
       { market-identifier: market-identifier, liquidity-provider: tx-sender }
@@ -396,126 +411,89 @@
       })
     )
     
-    (try! (stx-transfer? liquidity-amount tx-sender (as-contract tx-sender)))
-    (ok { liquidity-amount: liquidity-amount, deposit-block: block-height })
+    (ok true)
   )
 )
 
 ;; Public Function: Withdraw Liquidity from Market
-;; Allows liquidity providers to withdraw their position plus earned fees
-;; Can only withdraw after market is resolved or expired, and after lock period
+;; Allows liquidity providers to withdraw their liquidity and earned fees
 ;; Parameters:
-;;   - market-identifier: ID of the market to withdraw liquidity from
-;; Returns: Amount withdrawn including principal and earned fees
+;;   - market-identifier: ID of the market
+;; Returns: Amount withdrawn including earned fees
 (define-public (withdraw-market-liquidity (market-identifier uint))
   (let
     (
       (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
       (liquidity-position (unwrap! (map-get? liquidity-positions { market-identifier: market-identifier, liquidity-provider: tx-sender }) ERR-NO-LIQUIDITY-POSITION))
-      (lock-expired (>= block-height (+ (get deposit-block liquidity-position) minimum-liquidity-lock-period)))
+      (liquidity-amount (get liquidity-amount liquidity-position))
+      (deposit-block (get deposit-block liquidity-position))
+      (blocks-since-deposit (- block-height deposit-block))
+      (total-liquidity (get total-liquidity-pool market-data))
+      (accumulated-market-fees (get accumulated-fees market-data))
+      (provider-share (if (> total-liquidity u0)
+        (/ (* liquidity-amount accumulated-market-fees) total-liquidity)
+        u0))
+      (total-withdrawal (+ liquidity-amount provider-share))
     )
-    (asserts! lock-expired ERR-LIQUIDITY-LOCKED)
-    (asserts! (or 
-      (is-some (get resolved-outcome market-data))
+    ;; Validate market identifier is within valid range
+    (asserts! (validate-market-identifier market-identifier) ERR-PREDICTION-MARKET-NOT-FOUND)
+    
+    (asserts! (or
+      (>= blocks-since-deposit minimum-liquidity-lock-period)
       (check-market-expiration market-identifier)
-    ) ERR-BETTING-STILL-ACTIVE)
+    ) ERR-LIQUIDITY-LOCKED)
     
-    (let
-      (
-        (provider-share (if (> (get total-liquidity-pool market-data) u0)
-          (/ (* (get accumulated-fees market-data) (get liquidity-amount liquidity-position)) 
-             (get total-liquidity-pool market-data))
-          u0))
-        (total-withdrawal (+ (get liquidity-amount liquidity-position) provider-share))
-      )
-      (map-delete liquidity-positions { market-identifier: market-identifier, liquidity-provider: tx-sender })
-      
-      (map-set prediction-markets
-        { market-identifier: market-identifier }
-        (merge market-data {
-          total-liquidity-pool: (- (get total-liquidity-pool market-data) (get liquidity-amount liquidity-position)),
-          accumulated-fees: (- (get accumulated-fees market-data) provider-share)
-        })
-      )
-      
-      (as-contract (stx-transfer? total-withdrawal tx-sender tx-sender))
-    )
-  )
-)
-
-;; Public Function: Calculate Liquidity Provider Earnings
-;; Read-only helper to calculate potential earnings for a liquidity provider
-;; Parameters:
-;;   - market-identifier: ID of the market
-;;   - liquidity-provider: Principal of the liquidity provider
-;; Returns: Calculated earnings based on current accumulated fees
-(define-read-only (calculate-liquidity-earnings (market-identifier uint) (liquidity-provider principal))
-  (let
-    (
-      (market-data (unwrap! (map-get? prediction-markets { market-identifier: market-identifier }) ERR-PREDICTION-MARKET-NOT-FOUND))
-      (liquidity-position (unwrap! (map-get? liquidity-positions { market-identifier: market-identifier, liquidity-provider: liquidity-provider }) ERR-NO-LIQUIDITY-POSITION))
-    )
-    (ok (if (> (get total-liquidity-pool market-data) u0)
-      (/ (* (get accumulated-fees market-data) (get liquidity-amount liquidity-position)) 
-         (get total-liquidity-pool market-data))
-      u0))
-  )
-)
-
-;; FEE COLLECTION AND DISTRIBUTION SYSTEM
-
-;; Public Function: Withdraw Platform Fees
-;; Allows platform administrator to withdraw accumulated platform fees
-;; Parameters:
-;;   - withdrawal-amount: Amount of fees to withdraw
-;; Returns: Success confirmation with withdrawal amount
-(define-public (withdraw-platform-fees (withdrawal-amount uint))
-  (let
-    (
-      (available-fees (var-get total-platform-fees-collected))
-    )
-    (asserts! (is-eq tx-sender (var-get platform-administrator)) ERR-UNAUTHORIZED-ACCESS)
-    (asserts! (> withdrawal-amount u0) ERR-INVALID-PARAMETER-VALUE)
-    (asserts! (<= withdrawal-amount available-fees) ERR-NO-FEES-TO-COLLECT)
+    (map-delete liquidity-positions { market-identifier: market-identifier, liquidity-provider: tx-sender })
     
-    (var-set total-platform-fees-collected (- available-fees withdrawal-amount))
-    (as-contract (stx-transfer? withdrawal-amount tx-sender (var-get platform-administrator)))
+    (map-set prediction-markets
+      { market-identifier: market-identifier }
+      (merge market-data {
+        total-liquidity-pool: (- (get total-liquidity-pool market-data) liquidity-amount),
+        accumulated-fees: (- (get accumulated-fees market-data) provider-share)
+      })
+    )
+    
+    (as-contract (stx-transfer? total-withdrawal tx-sender tx-sender))
   )
 )
 
-;; Public Function: Allocate Fees to Beneficiary
-;; Allows platform administrator to allocate fees to specific beneficiaries
-;; Useful for distributing fees to stakeholders, treasury, or development fund
+;; Admin Function: Allocate Fees to Beneficiary
+;; Allows platform administrator to allocate platform fees to specific beneficiaries
 ;; Parameters:
 ;;   - beneficiary: Principal to receive fee allocation
-;;   - allocation-amount: Amount of fees to allocate
+;;   - allocation-amount: Amount to allocate
 ;; Returns: Success confirmation
 (define-public (allocate-fees-to-beneficiary (beneficiary principal) (allocation-amount uint))
   (let
     (
-      (available-fees (var-get total-platform-fees-collected))
-      (existing-beneficiary (default-to { accumulated-fees: u0 } 
+      (existing-allocation (default-to { accumulated-fees: u0 } 
         (map-get? fee-beneficiaries { beneficiary: beneficiary })))
     )
     (asserts! (is-eq tx-sender (var-get platform-administrator)) ERR-UNAUTHORIZED-ACCESS)
+    (asserts! (<= allocation-amount (var-get total-platform-fees-collected)) ERR-INSUFFICIENT-BALANCE)
     (asserts! (> allocation-amount u0) ERR-INVALID-PARAMETER-VALUE)
-    (asserts! (<= allocation-amount available-fees) ERR-NO-FEES-TO-COLLECT)
     
-    (var-set total-platform-fees-collected (- available-fees allocation-amount))
+    ;; Validate that beneficiary is not a zero address (basic validation)
+    (asserts! (not (is-eq beneficiary (var-get platform-administrator))) ERR-INVALID-PARAMETER-VALUE)
     
     (map-set fee-beneficiaries
       { beneficiary: beneficiary }
-      { accumulated-fees: (+ (get accumulated-fees existing-beneficiary) allocation-amount) }
+      {
+        accumulated-fees: (+ (get accumulated-fees existing-allocation) allocation-amount)
+      }
     )
-    (ok allocation-amount)
+    
+    (var-set total-platform-fees-collected 
+      (- (var-get total-platform-fees-collected) allocation-amount))
+    
+    (ok true)
   )
 )
 
-;; Public Function: Claim Allocated Fees
-;; Allows beneficiaries to claim their allocated fees
-;; Parameters: None (uses tx-sender as beneficiary)
-;; Returns: Amount claimed
-(define-public (claim-allocated-fees)
+;; Public Function: Withdraw Beneficiary Fees
+;; Allows fee beneficiaries to withdraw their allocated fees
+;; Returns: Amount withdrawn
+(define-public (withdraw-beneficiary-fees)
   (let
     (
       (beneficiary-data (unwrap! (map-get? fee-beneficiaries { beneficiary: tx-sender }) ERR-NO-FEES-TO-COLLECT))
